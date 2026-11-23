@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/utmstack/go-sdk/v2/store"
+	"github.com/threatwinds/go-sdk/store"
 )
 
 // SecondaryValueRewrite returns a Config.SecondaryValue that swaps a filter's
