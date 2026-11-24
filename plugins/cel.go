@@ -7,39 +7,80 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/interpreter"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/threatwinds/go-sdk/catcher"
 	"github.com/threatwinds/go-sdk/utils"
+	"github.com/tidwall/gjson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
-
-	"reflect"
-	"time"
 )
 
+const fastCacheMaxEntries = 8192
+
+type fastCacheEntry struct {
+	prg           cel.Program
+	needsFallback bool
+}
+
+// dataOnlyActivation implements interpreter.Activation exposing only `_data_`
+// without allocating a map[string]any per evaluation.
+type dataOnlyActivation struct {
+	data string
+}
+
+func (a *dataOnlyActivation) ResolveName(name string) (any, bool) {
+	if name == "_data_" {
+		return a.data, true
+	}
+	return nil, false
+}
+
+func (a *dataOnlyActivation) Parent() interpreter.Activation { return nil }
+
 // CELCache provides a thread-safe cache for compiled CEL (Common Expression Language) programs.
-// It uses an LRU cache to store and reuse programs to optimize evaluation performance.
+// Expressions that only reference `_data_` (all string-keyed overloads such as equals, contains,
+// exists, inCIDR, regexMatch, safe, etc.) compile once against a singleton baseEnv and run via a
+// bounded concurrent sync.Map fast path with zero JSON unmarshaling, zero map allocation, and
+// zero LRU lock contention. Expressions that reference top-level variables fall back transparently
+// to a variable-typed LRU cache.
 type CELCache struct {
+	baseEnvOnce sync.Once
+	baseEnv     *cel.Env
+	baseEnvErr  error
+
+	fastCache      sync.Map // raw expression -> *fastCacheEntry
+	fastCacheCount atomic.Int64
+	fastResetMu    sync.Mutex
+
 	cache       *expirable.LRU[string, *cachedProgram]
 	once        sync.Once
 	locks       [1024]sync.Mutex
 	processName string
 }
 
-// CELActivation holds the parsed view of an event that CEL expressions evaluate against:
-// the values map (top-level fields as named variables) plus the raw JSON string exposed
-// to the string-keyed overloads as `_data_`. Preparing one per event — instead of per
-// expression — is what lets a rule loop evaluate N expressions against the same data
-// without re-serializing/re-parsing the event N times (see PrepareActivation).
+// CELActivation holds the evaluation context for an event.
+// On the fast path (expressions using only `_data_` string-keyed overloads),
+// PrepareActivation performs zero json.Unmarshal and zero map allocation.
+// If any expression evaluated against the activation requires top-level
+// variables, the values map and keyMaterial are computed lazily once and reused
+// for subsequent fallback evaluations on the same event.
 type CELActivation struct {
-	valuesMap map[string]interface{}
-	jsonData  string
-	keyMat    string
+	jsonData string
+	dataAct  dataOnlyActivation
+
+	fallbackOnce sync.Once
+	valuesMap    map[string]interface{}
+	keyMat       string
+	fallbackErr  error
 }
 
 // NewCELCache creates and returns a new instance of CELCache for the specified process.
@@ -55,28 +96,8 @@ func (c *CELCache) getLock(key string) *sync.Mutex {
 	return &c.locks[h.Sum32()%1024]
 }
 
-// Get retrieves a compiled CEL program from the cache or compiles it if not present.
-// It then executes the program with the provided valuesMap and returns the result.
-func (c *CELCache) Get(cacheKey string, expression string, valuesMap map[string]interface{}, envOption ...cel.EnvOption) (bool, error) {
-	c.once.Do(func() {
-		c.cache = expirable.NewLRU[string, *cachedProgram](10000, nil, time.Hour*24)
-	})
-
-	if cp, ok := c.cache.Get(cacheKey); ok {
-		return c.execute(cp.prg, valuesMap)
-	}
-
-	// Use a sharded lock to prevent multiple simultaneous compilations of the same expression
-	lock := c.getLock(cacheKey)
-	lock.Lock()
-	defer lock.Unlock()
-
-	// Double-check the cache after acquiring the lock
-	if cp, ok := c.cache.Get(cacheKey); ok {
-		return c.execute(cp.prg, valuesMap)
-	}
-
-	envOptions := []cel.EnvOption{
+func (c *CELCache) baseEnvOptions() []cel.EnvOption {
+	return []cel.EnvOption{
 		cel.Variable("_data_", cel.StringType),
 		c.celExists(),
 		c.safe(),
@@ -100,8 +121,116 @@ func (c *CELCache) Get(cacheKey string, expression string, valuesMap map[string]
 		c.isWorkDay(),
 		c.isBetweenTime(),
 	}
+}
 
-	// Add the provided environment options first (including cel.Types)
+func (c *CELCache) getBaseEnv() (*cel.Env, error) {
+	c.baseEnvOnce.Do(func() {
+		c.baseEnv, c.baseEnvErr = cel.NewEnv(c.baseEnvOptions()...)
+	})
+	return c.baseEnv, c.baseEnvErr
+}
+
+func (c *CELCache) storeFastEntry(expr string, entry *fastCacheEntry) {
+	if _, loaded := c.fastCache.LoadOrStore(expr, entry); loaded {
+		return
+	}
+	if c.fastCacheCount.Add(1) > fastCacheMaxEntries {
+		c.fastResetMu.Lock()
+		if c.fastCacheCount.Load() > fastCacheMaxEntries {
+			c.fastCache.Range(func(k, _ any) bool {
+				c.fastCache.Delete(k)
+				return true
+			})
+			c.fastCacheCount.Store(0)
+			c.fastCache.Store(expr, entry)
+			c.fastCacheCount.Store(1)
+		}
+		c.fastResetMu.Unlock()
+	}
+}
+
+// compileFast attempts to resolve or compile expression against the singleton
+// `_data_`-only baseEnv. Returns (prg, true, nil) when the expression runs on
+// the fast path, or (nil, false, nil) when it requires top-level variables (or
+// has a compile error that the fallback path reports with full context).
+func (c *CELCache) compileFast(expression string) (cel.Program, bool, error) {
+	if expression == "" {
+		return nil, false, nil
+	}
+	if v, ok := c.fastCache.Load(expression); ok {
+		entry := v.(*fastCacheEntry)
+		if entry.needsFallback {
+			return nil, false, nil
+		}
+		return entry.prg, true, nil
+	}
+
+	lock := c.getLock(expression)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if v, ok := c.fastCache.Load(expression); ok {
+		entry := v.(*fastCacheEntry)
+		if entry.needsFallback {
+			return nil, false, nil
+		}
+		return entry.prg, true, nil
+	}
+
+	env, err := c.getBaseEnv()
+	if err != nil {
+		return nil, false, catcher.Error("failed to start CEL environment", err, map[string]any{})
+	}
+
+	transformedExpr := c.transformExpression(expression)
+	ast, issues := env.Compile(transformedExpr)
+	if issues != nil && issues.Err() != nil {
+		c.storeFastEntry(expression, &fastCacheEntry{needsFallback: true})
+		return nil, false, nil
+	}
+
+	prg, err := env.Program(ast)
+	if err != nil {
+		c.storeFastEntry(expression, &fastCacheEntry{needsFallback: true})
+		return nil, false, nil
+	}
+
+	c.storeFastEntry(expression, &fastCacheEntry{prg: prg})
+	return prg, true, nil
+}
+
+// Precompile warms the fast-path cache for an expression (e.g. during rule
+// loading). Expressions requiring top-level variables are recorded as fallback
+// without returning an error so startup never fails on legacy rules.
+func (c *CELCache) Precompile(expression string) error {
+	_, _, err := c.compileFast(expression)
+	return err
+}
+
+// Get retrieves a compiled CEL program from the variable-typed LRU cache or
+// compiles it if not present. It then executes the program with valuesMap.
+func (c *CELCache) Get(cacheKey string, expression string, valuesMap map[string]interface{}, envOption ...cel.EnvOption) (bool, error) {
+	c.once.Do(func() {
+		c.cache = expirable.NewLRU[string, *cachedProgram](10000, nil, time.Hour*24)
+	})
+
+	if cp, ok := c.cache.Get(cacheKey); ok {
+		return c.execute(cp.prg, valuesMap)
+	}
+
+	// Use a sharded lock to prevent multiple simultaneous compilations of the same expression
+	lock := c.getLock(cacheKey)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Double-check the cache after acquiring the lock
+	if cp, ok := c.cache.Get(cacheKey); ok {
+		return c.execute(cp.prg, valuesMap)
+	}
+
+	envOptions := c.baseEnvOptions()
+
+	// Add the provided environment options (including cel.Types)
 	envOptions = append(envOptions, envOption...)
 
 	for k, v := range valuesMap {
@@ -134,7 +263,8 @@ func (c *CELCache) Get(cacheKey string, expression string, valuesMap map[string]
 		})
 	}
 
-	c.cache.Add(cacheKey, &cachedProgram{prg: prg, env: celEnv})
+	// Store only the compiled program; do not retain *cel.Env in the LRU heap.
+	c.cache.Add(cacheKey, &cachedProgram{prg: prg})
 
 	return c.execute(prg, valuesMap)
 }
@@ -143,7 +273,6 @@ var rCache = new(RegexpCache)
 
 type cachedProgram struct {
 	prg cel.Program
-	env *cel.Env
 }
 
 // keyMaterial is the sorted "key:Type" join of a values map, used to key the compiled
@@ -161,11 +290,11 @@ func keyMaterial(valuesMap map[string]interface{}) string {
 	return strings.Join(keys, ",")
 }
 
-func (c *CELCache) getCacheKey(expression, material string) string {
-	h := sha256.New()
-	h.Write([]byte(expression))
-	h.Write([]byte(material))
-	return hex.EncodeToString(h.Sum(nil))
+func (c *CELCache) getCacheKey(expression, keyMat string) string {
+	hash := sha256.New()
+	hash.Write([]byte(expression))
+	hash.Write([]byte(keyMat))
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func (c *CELCache) transformExpression(expression string) string {
@@ -186,12 +315,29 @@ func (c *CELCache) transformExpression(expression string) string {
 	return expression
 }
 
-// Eval evaluates a CEL expression against the given data and returns the boolean result if successful.
-// 'data' can be a proto.Message, a JSON string (or *string), or a map[string]any.
-//
-// It prepares a fresh activation for every call, which means the event is serialized/parsed
-// once per expression. Callers that evaluate many expressions against the same event (e.g. a
-// rule loop) should call PrepareActivation once and EvalWithActivation per expression instead.
+func (a *CELActivation) ensureFallback(processName string) (map[string]interface{}, string, error) {
+	a.fallbackOnce.Do(func() {
+		if a.valuesMap == nil {
+			var m map[string]interface{}
+			if err := json.Unmarshal([]byte(a.jsonData), &m); err != nil {
+				a.fallbackErr = catcher.Error("failed to unmarshal JSON data", err, map[string]any{
+					"process": processName,
+				})
+				return
+			}
+			if m == nil {
+				m = make(map[string]interface{})
+			}
+			a.valuesMap = m
+		}
+		a.keyMat = keyMaterial(a.valuesMap)
+		a.valuesMap["_data_"] = a.jsonData
+	})
+	return a.valuesMap, a.keyMat, a.fallbackErr
+}
+
+// Eval evaluates a CEL expression against the provided data.
+// The data can be a proto.Message, JSON string, *string, map[string]interface{}, or any struct.
 func (c *CELCache) Eval(expression string, data any, envOption ...cel.EnvOption) (bool, error) {
 	act, err := c.PrepareActivation(data)
 	if err != nil {
@@ -200,10 +346,10 @@ func (c *CELCache) Eval(expression string, data any, envOption ...cel.EnvOption)
 	return c.EvalWithActivation(expression, act, envOption...)
 }
 
-// PrepareActivation converts 'data' (a proto.Message, JSON string/*string, map, or other
-// JSON-encodable value) into a CELActivation: the values map exposed as named CEL variables
-// plus the raw JSON string exposed as `_data_` to the string-keyed overloads. It is the
-// expensive half of evaluation (proto -> json -> map); do it once per event, not per rule.
+// PrepareActivation builds a reusable activation for an event.
+// For string, *string, and proto.Message inputs, it avoids json.Unmarshal and
+// map[string]interface{} allocation entirely unless an evaluated expression
+// requires top-level variables.
 func (c *CELCache) PrepareActivation(data any) (*CELActivation, error) {
 	if data == nil {
 		return nil, catcher.Error("failed to evaluate CEL expression", errors.New("required parameter 'data' is nil"), map[string]any{
@@ -223,12 +369,6 @@ func (c *CELCache) PrepareActivation(data any) (*CELActivation, error) {
 			})
 		}
 		jsonData = *jsonPtr
-		err = json.Unmarshal([]byte(jsonData), &valuesMap)
-		if err != nil {
-			return nil, catcher.Error("failed to convert proto to map for CEL evaluation", err, map[string]any{
-				"process": c.processName,
-			})
-		}
 	case *string:
 		if v == nil {
 			return nil, catcher.Error("failed to evaluate CEL expression", errors.New("data pointer is nil"), map[string]any{
@@ -236,17 +376,15 @@ func (c *CELCache) PrepareActivation(data any) (*CELActivation, error) {
 			})
 		}
 		jsonData = *v
-		err := json.Unmarshal([]byte(jsonData), &valuesMap)
-		if err != nil {
-			return nil, catcher.Error("failed to unmarshal JSON data", err, map[string]any{
+		if !gjson.Valid(jsonData) {
+			return nil, catcher.Error("failed to unmarshal JSON data", errors.New("invalid JSON input"), map[string]any{
 				"process": c.processName,
 			})
 		}
 	case string:
 		jsonData = v
-		err := json.Unmarshal([]byte(jsonData), &valuesMap)
-		if err != nil {
-			return nil, catcher.Error("failed to unmarshal JSON data", err, map[string]any{
+		if !gjson.Valid(jsonData) {
+			return nil, catcher.Error("failed to unmarshal JSON data", errors.New("invalid JSON input"), map[string]any{
 				"process": c.processName,
 			})
 		}
@@ -255,7 +393,6 @@ func (c *CELCache) PrepareActivation(data any) (*CELActivation, error) {
 		b, _ := json.Marshal(v)
 		jsonData = string(b)
 	default:
-		// Attempt to handle other types by converting to JSON first
 		b, err := json.Marshal(v)
 		if err != nil {
 			return nil, catcher.Error("failed to marshal data to JSON", err, map[string]any{
@@ -263,31 +400,19 @@ func (c *CELCache) PrepareActivation(data any) (*CELActivation, error) {
 			})
 		}
 		jsonData = string(b)
-		err = json.Unmarshal(b, &valuesMap)
-		if err != nil {
-			return nil, catcher.Error("failed to unmarshal intermediate JSON data", err, map[string]any{
-				"process": c.processName,
-			})
-		}
 	}
 
-	if valuesMap == nil {
-		valuesMap = make(map[string]interface{})
-	}
-
-	// The compiled-program cache is keyed by which top-level keys (and their types) exist,
-	// not by their values. Compute it before injecting the internal _data_ key.
-	keyMat := keyMaterial(valuesMap)
-
-	// Internal data for overloads
-	valuesMap["_data_"] = jsonData
-
-	return &CELActivation{valuesMap: valuesMap, jsonData: jsonData, keyMat: keyMat}, nil
+	return &CELActivation{
+		jsonData:  jsonData,
+		dataAct:   dataOnlyActivation{data: jsonData},
+		valuesMap: valuesMap,
+	}, nil
 }
 
-// EvalWithActivation evaluates 'expression' against a pre-prepared activation, reusing the
-// parsed values map (and the cached compiled program) instead of re-deriving it. This is the
-// fast path for rule loops: prepare once per event, call this once per rule.
+// EvalWithActivation evaluates expression against a pre-prepared activation.
+// When envOption is empty and expression only uses `_data_` string-keyed
+// overloads, it runs on the zero-unmarshal fast path; otherwise it lazily
+// prepares the values map once and evaluates against the variable-typed cache.
 func (c *CELCache) EvalWithActivation(expression string, act *CELActivation, envOption ...cel.EnvOption) (bool, error) {
 	if act == nil {
 		return false, catcher.Error("failed to evaluate CEL expression", errors.New("activation is nil"), map[string]any{
@@ -295,14 +420,47 @@ func (c *CELCache) EvalWithActivation(expression string, act *CELActivation, env
 		})
 	}
 
-	cacheKey := c.getCacheKey(expression, act.keyMat)
-	return c.Get(cacheKey, expression, act.valuesMap, envOption...)
+	if len(envOption) == 0 {
+		prg, ok, err := c.compileFast(expression)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			return c.executeActivation(prg, &act.dataAct)
+		}
+	}
+
+	valuesMap, keyMat, err := act.ensureFallback(c.processName)
+	if err != nil {
+		return false, err
+	}
+
+	cacheKey := c.getCacheKey(expression, keyMat)
+	return c.Get(cacheKey, expression, valuesMap, envOption...)
 }
 
 // Evaluate is a wrapper around Eval for backward compatibility.
 // Note: It uses (data, expression) order while Eval uses (expression, data).
 func (c *CELCache) Evaluate(data *string, expression string, envOption ...cel.EnvOption) (bool, error) {
 	return c.Eval(expression, data, envOption...)
+}
+
+// executeActivation evaluates a compiled program with an interpreter.Activation,
+// preserving the exact "failed to evaluate program" error message contract.
+func (c *CELCache) executeActivation(prg cel.Program, act interpreter.Activation) (bool, error) {
+	out, details, err := prg.Eval(act)
+	if err != nil {
+		return false, catcher.Error("failed to evaluate program", err, map[string]any{
+			"details": details,
+			"process": c.processName,
+		})
+	}
+
+	if out.Type() == cel.BoolType {
+		return out.Value().(bool), nil
+	}
+
+	return false, nil
 }
 
 // execute is the internal method that performs the actual CEL program evaluation.

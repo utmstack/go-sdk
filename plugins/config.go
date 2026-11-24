@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/threatwinds/go-sdk/catcher"
@@ -16,9 +17,44 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-var cfg *Config
+type configSnapshot struct {
+	cfg           *Config
+	generation    uint64
+	pluginCfgJSON map[string]gjson.Result
+}
+
+var cfgSnap atomic.Pointer[configSnapshot]
+var cfgGen atomic.Uint64
 var cfgOnce sync.Once
-var cfgMutex sync.RWMutex
+var cfgMutex sync.Mutex
+
+// ConfigGeneration returns the monotonically increasing configuration reload
+// generation (0 before the first load). Callers can cache derived indexes
+// (such as pipeline maps or expanded regexps) and refresh only when this value
+// changes.
+func ConfigGeneration() uint64 {
+	if snap := cfgSnap.Load(); snap != nil {
+		return snap.generation
+	}
+	return 0
+}
+
+func buildConfigSnapshot(c *Config) *configSnapshot {
+	parsed := make(map[string]gjson.Result, len(c.Plugins))
+	for name, pConfig := range c.Plugins {
+		if pConfig == nil {
+			continue
+		}
+		if bJson, err := utils.ProtoMessageToBytes(pConfig); err == nil && bJson != nil {
+			parsed[name] = gjson.ParseBytes(*bJson)
+		}
+	}
+	return &configSnapshot{
+		cfg:           c,
+		generation:    cfgGen.Add(1),
+		pluginCfgJSON: parsed,
+	}
+}
 
 type fileState struct {
 	modTime time.Time
@@ -259,11 +295,7 @@ func getNewStates() (map[string]fileState, bool) {
 func updateCfg(processName string) {
 	newStates, changed := getNewStates()
 
-	cfgMutex.RLock()
-	env := cfg.Env
-	cfgMutex.RUnlock()
-
-	if env != nil && !changed {
+	if snap := cfgSnap.Load(); snap != nil && snap.cfg != nil && snap.cfg.Env != nil && !changed {
 		return
 	}
 
@@ -302,20 +334,14 @@ func updateCfg(processName string) {
 	}()
 
 	cfgMutex.Lock()
+	defer cfgMutex.Unlock()
 
 	tmpCfg := new(Config)
 	tmpCfg.Plugins = make(map[string]*Value)
 	tmpCfg.Patterns = make(map[string]string)
 	tmpCfg.loadCfg(processName)
 
-	cfg.Pipeline = tmpCfg.Pipeline
-	cfg.DisabledRules = tmpCfg.DisabledRules
-	cfg.Tenants = tmpCfg.Tenants
-	cfg.Patterns = tmpCfg.Patterns
-	cfg.Plugins = tmpCfg.Plugins
-	cfg.Env = tmpCfg.Env
-
-	cfgMutex.Unlock()
+	cfgSnap.Store(buildConfigSnapshot(tmpCfg))
 
 	statesMutex.Lock()
 	lastFileStates = newStates
@@ -325,11 +351,9 @@ func updateCfg(processName string) {
 // GetCfg initializes the configuration if it hasn't been initialized yet,
 // and starts a goroutine to periodically update the configuration every 60 seconds.
 // It waits for the initial configuration to be set before returning it.
-// The function returns a pointer to the Config struct.
+// The function returns an immutable snapshot pointer to the Config struct.
 func GetCfg(processName string) *Config {
 	cfgOnce.Do(func() {
-		cfg = new(Config)
-
 		// Start the lock monitor goroutine
 		startLockMonitor(processName)
 
@@ -343,47 +367,22 @@ func GetCfg(processName string) *Config {
 		}()
 	})
 
-	for cfg.Env == nil {
+	for {
+		if snap := cfgSnap.Load(); snap != nil && snap.cfg != nil && snap.cfg.Env != nil {
+			return snap.cfg
+		}
 		time.Sleep(1 * time.Second)
 	}
-
-	cfgMutex.RLock()
-	defer cfgMutex.RUnlock()
-
-	return cfg
 }
 
-// PluginCfg retrieves the configuration for a specified plugin by name and unmarshal it into the provided type.
-// The function returns a pointer to the configuration of the specified type and a pointer to an error if any error occurs.
-//
-// Parameters:
-//
-//	pluginName: The name of the plugin whose configuration is to be retrieved.
-//	wait: A boolean value that determines whether the function should wait for the configuration to be available.
-//
-// Returns:
-//
-//	gjson.Result: An object containing the configuration of the specified plugin.
+// PluginCfg retrieves the pre-parsed JSON configuration for a specified plugin
+// by name from the current immutable config snapshot with zero per-call
+// protobuf/JSON marshaling.
 func PluginCfg(pluginName string) gjson.Result {
-	for {
-		cfg := GetCfg(fmt.Sprintf("plugin_%s", pluginName))
-
-		if cfg.Plugins == nil {
-			return gjson.Result{}
-		}
-
-		pConfig, ok := cfg.Plugins[pluginName]
-		if !ok {
-			return gjson.Result{}
-		}
-
-		bJson, err := utils.ProtoMessageToBytes(pConfig)
-		if err != nil {
-			return gjson.Result{}
-		}
-
-		pJson := gjson.ParseBytes(*bJson)
-
-		return pJson
+	_ = GetCfg(fmt.Sprintf("plugin_%s", pluginName))
+	snap := cfgSnap.Load()
+	if snap == nil || snap.pluginCfgJSON == nil {
+		return gjson.Result{}
 	}
+	return snap.pluginCfgJSON[pluginName]
 }
