@@ -10,7 +10,7 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/stretchr/testify v1.12.1
-	github.com/threatwinds/go-sdk v1.1.43
+	github.com/threatwinds/go-sdk v1.2.1
 	github.com/tidwall/gjson v1.20.5
 	github.com/tidwall/sjson v1.2.11
 	google.golang.org/grpc v1.85.0
