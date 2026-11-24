@@ -258,21 +258,26 @@ func New(cfg Config, opts Options) (*Built, error) {
 		OnSecondaryError:  opts.OnSecondaryError,
 		Now:               opts.Now,
 	}
+	rw := composite.DocRewrite{}
 	if fp := cfg.Secondary.FieldPrefix; fp != nil {
 		cc.SecondaryField, cc.SecondaryFieldBack = composite.PrefixMap(fp.Primary, fp.Secondary)
-		cc.SecondaryDocument = composite.RenameDocKey(fp.Secondary, fp.Primary)
+		rw.RenameFrom, rw.RenameTo = fp.Secondary, fp.Primary
 	}
 	if vm := cfg.Secondary.FieldValueMaps; len(vm) > 0 {
 		cc.SecondaryValue = composite.SecondaryValueRewrite(vm)
+		rw.Values = vm // keys are the secondary's field name, which is what records carry
 	}
 	// A configured timeRemap rewrites the secondary's timestamp into the primary's
 	// rendering, so a merged page reads like the primary alone.
 	if tm := cfg.Secondary.TimeRemap; tm != "" && cfg.Secondary.Engine.Engine == EngineOpenSearch {
-		ts := cfg.Secondary.OpenSearch.TimestampField
-		if ts == "" {
-			ts = opensearch.DefaultTimestampField
+		rw.TimeField = cfg.Secondary.OpenSearch.TimestampField
+		if rw.TimeField == "" {
+			rw.TimeField = opensearch.DefaultTimestampField
 		}
-		cc.SecondaryDocument = composite.ChainDocs(cc.SecondaryDocument, composite.RemapTime(ts, tm))
+		rw.TimeLayout = tm
+	}
+	if rw.RenameFrom != "" || rw.TimeField != "" || len(rw.Values) > 0 {
+		cc.SecondaryDocument = rw.Apply
 	}
 
 	comp, err := composite.New(cc)
