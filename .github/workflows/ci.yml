@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [v1, v2]
+  pull_request:
+    branches: [v1, v2]
+
+jobs:
+  test:
+    name: Test & Dependency Guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Guard against forbidden threatwinds/go-sdk/{plugins,store} deps
+        run: |
+          if go list -f '{{join .Deps "\n"}}' ./... | grep -E 'github\.com/threatwinds/go-sdk/(plugins|store)'; then
+            echo "Error: forbidden transitive dependency on threatwinds/go-sdk/{plugins,store}" >&2
+            exit 1
+          fi
+
+      - name: Run unit tests with race detector
+        run: go test -race -short ./...
