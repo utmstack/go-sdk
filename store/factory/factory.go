@@ -119,6 +119,10 @@ type Secondary struct {
 	// TolerateFailure answers from the primary when the secondary fails, instead
 	// of failing the read.
 	TolerateFailure bool `json:"tolerateFailure,omitempty"`
+	// TimeRemap is the Go layout to rewrite the secondary's timestamp field into,
+	// so its records read like the primary's ("2006-01-02 15:04:05.000"). Empty
+	// means the value comes back as the secondary stored it.
+	TimeRemap string `json:"timeRemap,omitempty"`
 	// FieldPrefix maps the object that holds parsed fields: the primary's name
 	// for it and the secondary's ("log" and "event"). It applies to field names in
 	// queries and to the records that come back.
@@ -260,6 +264,15 @@ func New(cfg Config, opts Options) (*Built, error) {
 	}
 	if vm := cfg.Secondary.FieldValueMaps; len(vm) > 0 {
 		cc.SecondaryValue = composite.SecondaryValueRewrite(vm)
+	}
+	// A configured timeRemap rewrites the secondary's timestamp into the primary's
+	// rendering, so a merged page reads like the primary alone.
+	if tm := cfg.Secondary.TimeRemap; tm != "" && cfg.Secondary.Engine.Engine == EngineOpenSearch {
+		ts := cfg.Secondary.OpenSearch.TimestampField
+		if ts == "" {
+			ts = opensearch.DefaultTimestampField
+		}
+		cc.SecondaryDocument = composite.ChainDocs(cc.SecondaryDocument, composite.RemapTime(ts, tm))
 	}
 
 	comp, err := composite.New(cc)

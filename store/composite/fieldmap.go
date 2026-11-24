@@ -3,6 +3,7 @@ package composite
 import (
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/threatwinds/go-sdk/store"
 )
@@ -108,5 +109,67 @@ func RenameDocKey(from, to string) func(json.RawMessage) json.RawMessage {
 			return doc
 		}
 		return out
+	}
+}
+
+// RemapTime returns a Config.SecondaryDocument that reformats one top-level
+// field's date into layout, so that the secondary's records read like the
+// primary's (its DateTime64(3, 'UTC') column renders
+// "2006-01-02 15:04:05.000"). A record without the field, a field that is not
+// a string, or a value that does not parse as RFC 3339 passes through
+// unchanged.
+func RemapTime(field, layout string) func(json.RawMessage) json.RawMessage {
+	return func(doc json.RawMessage) json.RawMessage {
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(doc, &top); err != nil {
+			return doc
+		}
+		raw, ok := top[field]
+		if !ok {
+			return doc
+		}
+		var s string
+		if json.Unmarshal(raw, &s) != nil {
+			return doc
+		}
+		t, err := time.Parse(time.RFC3339Nano, s)
+		if err != nil {
+			return doc
+		}
+		top[field], _ = json.Marshal(t.UTC().Format(layout))
+		out, err := json.Marshal(top)
+		if err != nil {
+			return doc
+		}
+		return out
+	}
+}
+
+// ChainDocs applies the document fns in order and returns their composition,
+// or nil when there is none, so a Config takes one hook.
+func ChainDocs(fns ...func(json.RawMessage) json.RawMessage) func(json.RawMessage) json.RawMessage {
+	n := 0
+	for _, f := range fns {
+		if f != nil {
+			n++
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	if n == 1 {
+		for _, f := range fns {
+			if f != nil {
+				return f
+			}
+		}
+	}
+	return func(doc json.RawMessage) json.RawMessage {
+		for _, f := range fns {
+			if f != nil {
+				doc = f(doc)
+			}
+		}
+		return doc
 	}
 }

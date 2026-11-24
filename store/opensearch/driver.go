@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	defaultTimestampField = "@timestamp"
+	DefaultTimestampField = "@timestamp"
 	defaultBucketLimit    = 10
 )
 
@@ -54,7 +54,7 @@ func New(cfg Config) (*Driver, error) {
 		return nil, fmt.Errorf("opensearch: Config.TenantField is required")
 	}
 	if cfg.TimestampField == "" {
-		cfg.TimestampField = defaultTimestampField
+		cfg.TimestampField = DefaultTimestampField
 	}
 	return &Driver{cfg: cfg, mapper: sdkos.NewFieldMapper(), now: time.Now}, nil
 }

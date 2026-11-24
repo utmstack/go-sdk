@@ -139,7 +139,7 @@ func (c *Store) eligibleForSecondary(s store.Scope) bool {
 func (c *Store) plan(s store.Scope) plan {
 	var p plan
 
-	if s.To.IsZero() || !s.To.Before(c.cfg.Cutover) {
+	if s.To.IsZero() || s.From.Before(c.cfg.Cutover) {
 		ps := s
 		p.primary = &ps
 	}
