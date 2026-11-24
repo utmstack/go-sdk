@@ -3,7 +3,7 @@ package plugins
 import (
 	"testing"
 
-	"github.com/utmstack/go-sdk/v2/jsondoc"
+	"github.com/threatwinds/go-sdk/jsondoc"
 )
 
 var nativeDocs = []string{

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/utmstack/go-sdk/v2/store"
+	"github.com/threatwinds/go-sdk/store"
 )
 
 // CorrelationCache spares the store the same correlation search when events of one stream keep
