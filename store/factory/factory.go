@@ -265,7 +265,7 @@ func New(cfg Config, opts Options) (*Built, error) {
 	}
 	if vm := cfg.Secondary.FieldValueMaps; len(vm) > 0 {
 		cc.SecondaryValue = composite.SecondaryValueRewrite(vm)
-		rw.Values = vm // keys are the secondary's field name, which is what records carry
+		rw.Values = invertedValueMaps(vm) // records carry the secondary's form, so the swap runs backward
 	}
 	// A configured timeRemap rewrites the secondary's timestamp into the primary's
 	// rendering, so a merged page reads like the primary alone.
@@ -295,6 +295,24 @@ func New(cfg Config, opts Options) (*Built, error) {
 		b.ResolveIndexPattern = resolverFor(cfg.Primary)
 	}
 	return b, nil
+}
+
+// invertedValueMaps swaps each entry's direction: FieldValueMaps is written
+// primary-form → secondary-form for filters, but a record coming back from the
+// secondary carries the secondary form, so its rewrite needs the reverse. A
+// collision (two forms to one) keeps the first; configs are 1:1.
+func invertedValueMaps(vm map[string]map[string]string) map[string]map[string]string {
+	out := make(map[string]map[string]string, len(vm))
+	for field, m := range vm {
+		inv := make(map[string]string, len(m))
+		for from, to := range m {
+			if _, ok := inv[to]; !ok {
+				inv[to] = from
+			}
+		}
+		out[field] = inv
+	}
+	return out
 }
 
 func validate(cfg Config) error {

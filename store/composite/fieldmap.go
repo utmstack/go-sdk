@@ -170,8 +170,10 @@ func (r DocRewrite) Apply(doc json.RawMessage) json.RawMessage {
 			continue
 		}
 		var s string
-		if json.Unmarshal(raw, &s) != nil {
-			continue
+		// The value may be kept as a number even when the map keys it by its
+		// text form, so fall back to the raw JSON token on a string unmarshal miss.
+		if err := json.Unmarshal(raw, &s); err != nil {
+			s = string(raw)
 		}
 		if nv, hit := m[s]; hit {
 			top[field], _ = json.Marshal(nv)

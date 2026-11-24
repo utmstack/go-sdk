@@ -64,6 +64,13 @@ type Config struct {
 	TolerateSecondary bool
 	OnSecondaryError  func(op string, err error)
 
+	// SecondaryWritable lets a bulk writer put pre-Cutover records in the
+	// secondary store instead of only the primary. Off by default: the secondary
+	// stays read-only. Each record must carry a time field, so a writer can
+	// route it. A record the secondary does not hold — another tenant's, or one
+	// at or after the cutover — goes to the primary.
+	SecondaryWritable bool
+
 	// SecondaryField maps a field name as the composite's callers write it to the
 	// name the secondary store knows it by, and SecondaryFieldBack does the reverse.
 	// SecondaryDocument rewrites a secondary record into the shape the primary's
@@ -139,7 +146,7 @@ func (c *Store) eligibleForSecondary(s store.Scope) bool {
 func (c *Store) plan(s store.Scope) plan {
 	var p plan
 
-	if s.To.IsZero() || s.From.Before(c.cfg.Cutover) {
+	if s.To.IsZero() || s.To.After(c.cfg.Cutover) {
 		ps := s
 		p.primary = &ps
 	}
@@ -271,6 +278,9 @@ func (c *Store) Insert(ctx context.Context, s store.Scope, id string, doc any) e
 }
 
 func (c *Store) BulkWriter(dataset store.Dataset) (store.BulkWriter, error) {
+	if c.cfg.SecondaryWritable && c.datasets[dataset] {
+		return newSplitWriter(c, dataset)
+	}
 	return c.cfg.Primary.BulkWriter(dataset)
 }
 
