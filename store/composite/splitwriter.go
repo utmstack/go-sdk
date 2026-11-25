@@ -10,8 +10,10 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/threatwinds/go-sdk/catcher"
-	"github.com/threatwinds/go-sdk/store"
+	"github.com/utmstack/go-sdk/v2/store"
 )
+
+const clickhouseTimeReference = "2006-01-02 15:04:05"
 
 // splitWriter sends each record of a bulk write to whichever store holds it:
 // a record older than Cutover goes to the secondary, the rest to the primary.
@@ -105,6 +107,10 @@ func (w *splitWriter) docTime(doc []byte) (time.Time, error) {
 			fmt.Errorf("%q is missing", w.cfg.TimeField), map[string]any{"dataset": w.dataset})
 	}
 	if t, err := time.Parse(time.RFC3339Nano, v.String()); err == nil {
+		return t, nil
+	}
+
+	if t, err := time.Parse(clickhouseTimeReference, v.String()); err == nil {
 		return t, nil
 	}
 	return time.Time{}, catcher.Error("composite: bulk record time does not parse",

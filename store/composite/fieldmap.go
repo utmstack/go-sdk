@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/threatwinds/go-sdk/store"
+	"github.com/utmstack/go-sdk/v2/store"
 )
 
 // SecondaryValueRewrite returns a Config.SecondaryValue that swaps a filter's
@@ -127,6 +127,10 @@ type DocRewrite struct {
 	// layout the primary renders ("2006-01-02 15:04:05.000"). TimeField empty
 	// means no reformat; a value that does not parse passes through.
 	TimeField, TimeLayout string
+	// ReverseTime runs the reformat the other way: from TimeLayout back to RFC
+	// 3339, so a doc that came back remapped is valid for the secondary again
+	// before it is written.
+	ReverseTime bool
 	// Values maps a field's value, as the secondary keeps it, to the form the
 	// primary uses, so records read like the primary's.
 	Values map[string]map[string]string
@@ -156,7 +160,12 @@ func (r DocRewrite) Apply(doc json.RawMessage) json.RawMessage {
 		if raw, ok := top[r.TimeField]; ok {
 			var s string
 			if json.Unmarshal(raw, &s) == nil {
-				if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+				if r.ReverseTime {
+					if t, err := time.Parse(r.TimeLayout, s); err == nil {
+						top[r.TimeField], _ = json.Marshal(t.UTC().Format(time.RFC3339Nano))
+						changed = true
+					}
+				} else if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 					top[r.TimeField], _ = json.Marshal(t.UTC().Format(r.TimeLayout))
 					changed = true
 				}

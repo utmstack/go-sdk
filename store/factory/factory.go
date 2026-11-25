@@ -258,31 +258,38 @@ func New(cfg Config, opts Options) (*Built, error) {
 		OnSecondaryError:  opts.OnSecondaryError,
 		Now:               opts.Now,
 	}
-	rw := composite.DocRewrite{}
+	// rw turns a record the secondary keeps into the primary's shape for reads;
+	// ww turns a record the caller writes (the primary's shape) into the
+	// secondary's for the write path. Each configured difference contributes
+	// to both, one per direction, and they must never clobber each other.
+	rw, ww := composite.DocRewrite{}, composite.DocRewrite{}
 	if fp := cfg.Secondary.FieldPrefix; fp != nil {
 		cc.SecondaryField, cc.SecondaryFieldBack = composite.PrefixMap(fp.Primary, fp.Secondary)
 		rw.RenameFrom, rw.RenameTo = fp.Secondary, fp.Primary
+		ww.RenameFrom, ww.RenameTo = fp.Primary, fp.Secondary
 	}
 	if vm := cfg.Secondary.FieldValueMaps; len(vm) > 0 {
 		cc.SecondaryValue = composite.SecondaryValueRewrite(vm)
-		rw.Values = invertedValueMaps(vm)      // records carry the secondary's form, so the swap runs backward
-		ww := composite.DocRewrite{Values: vm} // written records carry the primary's form, so the swap runs forward
-		if fp := cfg.Secondary.FieldPrefix; fp != nil {
-			ww.RenameFrom, ww.RenameTo = fp.Primary, fp.Secondary
-		}
-		cc.SecondaryWriteDoc = ww.Apply
+		rw.Values = invertedValueMaps(vm) // records carry the secondary's form, so the swap runs backward
+		ww.Values = vm                    // written records carry the primary's form, so the swap runs forward
 	}
 	// A configured timeRemap rewrites the secondary's timestamp into the primary's
-	// rendering, so a merged page reads like the primary alone.
+	// rendering, so a merged page reads like the primary alone. The write path
+	// runs the same rewrite reversed, so a doc that came back remapped is valid
+	// for the secondary again before it is stored.
 	if tm := cfg.Secondary.TimeRemap; tm != "" && cfg.Secondary.Engine.Engine == EngineOpenSearch {
 		rw.TimeField = cfg.Secondary.OpenSearch.TimestampField
 		if rw.TimeField == "" {
 			rw.TimeField = opensearch.DefaultTimestampField
 		}
 		rw.TimeLayout = tm
+		ww.TimeField, ww.TimeLayout, ww.ReverseTime = rw.TimeField, tm, true
 	}
 	if rw.RenameFrom != "" || rw.TimeField != "" || len(rw.Values) > 0 {
 		cc.SecondaryDocument = rw.Apply
+	}
+	if ww.RenameFrom != "" || ww.TimeField != "" || len(ww.Values) > 0 {
+		cc.SecondaryWriteDoc = ww.Apply
 	}
 
 	comp, err := composite.New(cc)
