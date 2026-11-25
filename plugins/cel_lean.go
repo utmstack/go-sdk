@@ -5,7 +5,7 @@ import (
 
 	"cel.dev/cel-go/cel"
 	"github.com/threatwinds/go-sdk/catcher"
-	"github.com/threatwinds/go-sdk/jsondoc"
+	"github.com/utmstack/go-sdk/v2/jsondoc"
 )
 
 // maxLeanExpressions bounds the compiled-expression cache for callers that feed in dynamic expressions.

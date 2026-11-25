@@ -9,7 +9,7 @@ import (
 	"cel.dev/cel-go/common/ast"
 	"cel.dev/cel-go/common/types"
 	"cel.dev/cel-go/common/types/ref"
-	"github.com/threatwinds/go-sdk/jsondoc"
+	"github.com/utmstack/go-sdk/v2/jsondoc"
 	"github.com/tidwall/gjson"
 )
 
