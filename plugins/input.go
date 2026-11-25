@@ -19,13 +19,37 @@ import (
 var logsChannel chan *Log
 var logsChannelOnce sync.Once
 
-// SendLogsFromChannel listens to the logsChannel and sends logs
-// to the engine server via gRPC. It logs an error if the connection to the engine server fails,
-// if sending a notification fails, or if receiving an acknowledgment fails. It runs indefinitely
-// and should be run as a goroutine.
+// logsQueue is the channel plugins enqueue their logs on. It is made the first time anyone asks,
+// from either side, so a plugin that enqueues before the sender has started is never sending to a
+// channel that does not exist yet.
+func logsQueue() chan *Log {
+	logsChannelOnce.Do(func() {
+		logsChannel = make(chan *Log, runtime.NumCPU()*1000)
+	})
+
+	return logsChannel
+}
+
+// SendLogsFromChannel listens to the logsChannel and sends the logs on, by default straight to NATS
+// when NATS_URL is set and to the engine server over gRPC otherwise; LOGS_TRANSPORT ("nats", "grpc"
+// or "auto") overrides that. It logs an error if the connection fails, if sending a log fails, or if
+// receiving an acknowledgment fails. It runs indefinitely and should be run as a goroutine.
 func SendLogsFromChannel(pluginName string) {
 	processName := fmt.Sprintf("plugin_%s", pluginName)
 
+	queue := logsQueue()
+
+	if logsTransport() == "nats" {
+		sendLogsToNATS(pluginName, processName)
+
+		return
+	}
+
+	sendLogsToEngine(queue, processName)
+}
+
+// sendLogsToEngine sends what is enqueued to the engine server's input over the local socket.
+func sendLogsToEngine(queue <-chan *Log, processName string) {
 	socketDir, err := utils.MkdirJoin(WorkDir, "sockets")
 	if err != nil {
 		_ = catcher.Error("failed to create socket directory", err, map[string]any{
@@ -58,13 +82,9 @@ func SendLogsFromChannel(pluginName string) {
 		os.Exit(1)
 	}
 
-	logsChannelOnce.Do(func() {
-		logsChannel = make(chan *Log, runtime.NumCPU()*1000)
-	})
-
 	go func() {
 		for {
-			log := <-logsChannel
+			log := <-queue
 
 			err := inputClient.Send(log)
 			if err != nil {
@@ -101,7 +121,7 @@ func SendLogsFromChannel(pluginName string) {
 //   - log: The log to enqueue
 func EnqueueLog(log *Log, pluginName string) error {
 	select {
-	case logsChannel <- log:
+	case logsQueue() <- log:
 		return nil
 	case <-time.After(1 * time.Second):
 		return catcher.Error("cannot enqueue log", errors.New("queue is full"), map[string]any{
