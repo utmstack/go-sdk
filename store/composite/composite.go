@@ -64,13 +64,6 @@ type Config struct {
 	TolerateSecondary bool
 	OnSecondaryError  func(op string, err error)
 
-	// SecondaryWritable lets a bulk writer put pre-Cutover records in the
-	// secondary store instead of only the primary. Off by default: the secondary
-	// stays read-only. Each record must carry a time field, so a writer can
-	// route it. A record the secondary does not hold — another tenant's, or one
-	// at or after the cutover — goes to the primary.
-	SecondaryWritable bool
-
 	// SecondaryField maps a field name as the composite's callers write it to the
 	// name the secondary store knows it by, and SecondaryFieldBack does the reverse.
 	// SecondaryDocument rewrites a secondary record into the shape the primary's
@@ -86,6 +79,11 @@ type Config struct {
 	// Applied in SecondaryField's order, after the field name is already remapped,
 	// so the hook keys on the secondary's name. Optional.
 	SecondaryValue func(store.Filter) store.Filter
+
+	// SecondaryWriteDoc rewrites a record into the secondary's shape just before it
+	// is written to the secondary, so a composite caller keeps sending the primary's
+	// form in both directions, like SecondaryDocument does for reads. Optional.
+	SecondaryWriteDoc func(json.RawMessage) json.RawMessage
 
 	// Now is the clock, replaceable in tests.
 	Now func() time.Time
@@ -278,14 +276,67 @@ func (c *Store) Insert(ctx context.Context, s store.Scope, id string, doc any) e
 }
 
 func (c *Store) BulkWriter(dataset store.Dataset) (store.BulkWriter, error) {
-	if c.cfg.SecondaryWritable && c.datasets[dataset] {
+	if c.datasets[dataset] {
 		return newSplitWriter(c, dataset)
 	}
 	return c.cfg.Primary.BulkWriter(dataset)
 }
 
+// UpdateWhere reaches whichever store holds the records in the scope's window
+// and sums their updated counts. A record older than the cutover lives in the
+// secondary; a newer one in the primary; a window that spans the cutover
+// updates both.
 func (c *Store) UpdateWhere(ctx context.Context, s store.Scope, filters []store.Filter, patch map[string]any) (int64, error) {
-	return c.cfg.Primary.UpdateWhere(ctx, s, filters, patch)
+	p := c.plan(s)
+	if p.primary == nil && p.secondary == nil {
+		return 0, nil
+	}
+
+	var total int64
+	if p.primary != nil {
+		n, err := c.cfg.Primary.UpdateWhere(ctx, *p.primary, filters, patch)
+		if err != nil {
+			return 0, fmt.Errorf("composite: primary update: %w", err)
+		}
+		total += n
+	}
+	if p.secondary != nil {
+		n, err := c.cfg.Secondary.UpdateWhere(ctx, *p.secondary, c.secondaryFilters(filters), c.secondaryPatch(patch))
+		if err != nil {
+			if !c.secondaryFailed("update", err) {
+				return 0, fmt.Errorf("composite: secondary update: %w", err)
+			}
+		} else {
+			total += n
+		}
+	}
+	return total, nil
+}
+
+// secondaryPatch rewrites a patch to the secondary's field names and value
+// forms. Each field goes through SecondaryWriteDoc as a one-field document,
+// so the prefix rename and the value maps it carries apply exactly as they do
+// for a full record; a patch with no rewriter on it is renamed by field alone.
+func (c *Store) secondaryPatch(patch map[string]any) map[string]any {
+	out := make(map[string]any, len(patch))
+	for field, value := range patch {
+		name, v := field, value
+		if c.cfg.SecondaryWriteDoc != nil {
+			doc, _ := json.Marshal(map[string]any{name: value})
+			var top map[string]json.RawMessage
+			if err := json.Unmarshal(c.cfg.SecondaryWriteDoc(json.RawMessage(doc)), &top); err == nil && len(top) == 1 {
+				for k, raw := range top {
+					if json.Unmarshal(raw, &v) == nil {
+						name = k
+					}
+				}
+			}
+		} else if c.cfg.SecondaryField != nil {
+			name = c.cfg.SecondaryField(name)
+		}
+		out[name] = v
+	}
+	return out
 }
 
 func (c *Store) Flush(ctx context.Context, dataset store.Dataset) error {

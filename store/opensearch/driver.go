@@ -156,15 +156,19 @@ func (d *Driver) FetchPage(ctx context.Context, s store.Scope, filters []store.F
 	return docs, res.Hits.Total.Value, nil
 }
 
-// aggField picks the terms-aggregatable form of field: the .keyword
-// subfield where the config says the field is text-mapped, field itself
-// otherwise.
-func (d *Driver) aggField(field string) string {
+// exactField picks the exact-match form of a field: the .keyword subfield where
+// the config says the field is text-mapped, field itself otherwise. Shared by
+// aggregations, term/terms filters, and sorts — all of which need the unanalyzed
+// value.
+func (d *Driver) exactField(field string) string {
 	if d.cfg.KeywordFields[field] {
 		return field + ".keyword"
 	}
 	return field
 }
+
+// aggField keeps the aggregation-side name; it is exactField.
+func (d *Driver) aggField(field string) string { return d.exactField(field) }
 
 func (d *Driver) TopValues(ctx context.Context, s store.Scope, field string, filters []store.Filter, n int) ([]store.Bucket, error) {
 	if field == "" {
@@ -436,6 +440,8 @@ func (d *Driver) diskUsedPct(ctx context.Context) (float64, error) {
 // sortClause marks the timestamp as a date even where an index has no mapping
 // for it, so one stray index in a pattern cannot fail the whole search.
 func (d *Driver) sortClause(field string, order store.SortOrder) []map[string]any {
+	// Sorting a text field would ask for fielddata; use the .keyword form.
+	field = d.exactField(field)
 	spec := map[string]any{"order": string(order)}
 	if field == d.cfg.TimestampField {
 		spec["unmapped_type"] = "date"

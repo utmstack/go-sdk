@@ -265,7 +265,12 @@ func New(cfg Config, opts Options) (*Built, error) {
 	}
 	if vm := cfg.Secondary.FieldValueMaps; len(vm) > 0 {
 		cc.SecondaryValue = composite.SecondaryValueRewrite(vm)
-		rw.Values = invertedValueMaps(vm) // records carry the secondary's form, so the swap runs backward
+		rw.Values = invertedValueMaps(vm)      // records carry the secondary's form, so the swap runs backward
+		ww := composite.DocRewrite{Values: vm} // written records carry the primary's form, so the swap runs forward
+		if fp := cfg.Secondary.FieldPrefix; fp != nil {
+			ww.RenameFrom, ww.RenameTo = fp.Primary, fp.Secondary
+		}
+		cc.SecondaryWriteDoc = ww.Apply
 	}
 	// A configured timeRemap rewrites the secondary's timestamp into the primary's
 	// rendering, so a merged page reads like the primary alone.
