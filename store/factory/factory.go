@@ -119,6 +119,10 @@ type Secondary struct {
 	// TolerateFailure answers from the primary when the secondary fails, instead
 	// of failing the read.
 	TolerateFailure bool `json:"tolerateFailure,omitempty"`
+	// TimeRemap is the Go layout to rewrite the secondary's timestamp field into,
+	// so its records read like the primary's ("2006-01-02 15:04:05.000"). Empty
+	// means the value comes back as the secondary stored it.
+	TimeRemap string `json:"timeRemap,omitempty"`
 	// FieldPrefix maps the object that holds parsed fields: the primary's name
 	// for it and the secondary's ("log" and "event"). It applies to field names in
 	// queries and to the records that come back.
@@ -254,12 +258,38 @@ func New(cfg Config, opts Options) (*Built, error) {
 		OnSecondaryError:  opts.OnSecondaryError,
 		Now:               opts.Now,
 	}
+	// rw turns a record the secondary keeps into the primary's shape for reads;
+	// ww turns a record the caller writes (the primary's shape) into the
+	// secondary's for the write path. Each configured difference contributes
+	// to both, one per direction, and they must never clobber each other.
+	rw, ww := composite.DocRewrite{}, composite.DocRewrite{}
 	if fp := cfg.Secondary.FieldPrefix; fp != nil {
 		cc.SecondaryField, cc.SecondaryFieldBack = composite.PrefixMap(fp.Primary, fp.Secondary)
-		cc.SecondaryDocument = composite.RenameDocKey(fp.Secondary, fp.Primary)
+		rw.RenameFrom, rw.RenameTo = fp.Secondary, fp.Primary
+		ww.RenameFrom, ww.RenameTo = fp.Primary, fp.Secondary
 	}
 	if vm := cfg.Secondary.FieldValueMaps; len(vm) > 0 {
 		cc.SecondaryValue = composite.SecondaryValueRewrite(vm)
+		rw.Values = invertedValueMaps(vm) // records carry the secondary's form, so the swap runs backward
+		ww.Values = vm                    // written records carry the primary's form, so the swap runs forward
+	}
+	// A configured timeRemap rewrites the secondary's timestamp into the primary's
+	// rendering, so a merged page reads like the primary alone. The write path
+	// runs the same rewrite reversed, so a doc that came back remapped is valid
+	// for the secondary again before it is stored.
+	if tm := cfg.Secondary.TimeRemap; tm != "" && cfg.Secondary.Engine.Engine == EngineOpenSearch {
+		rw.TimeField = cfg.Secondary.OpenSearch.TimestampField
+		if rw.TimeField == "" {
+			rw.TimeField = opensearch.DefaultTimestampField
+		}
+		rw.TimeLayout = tm
+		ww.TimeField, ww.TimeLayout, ww.ReverseTime = rw.TimeField, tm, true
+	}
+	if rw.RenameFrom != "" || rw.TimeField != "" || len(rw.Values) > 0 {
+		cc.SecondaryDocument = rw.Apply
+	}
+	if ww.RenameFrom != "" || ww.TimeField != "" || len(ww.Values) > 0 {
+		cc.SecondaryWriteDoc = ww.Apply
 	}
 
 	comp, err := composite.New(cc)
@@ -277,6 +307,24 @@ func New(cfg Config, opts Options) (*Built, error) {
 		b.ResolveIndexPattern = resolverFor(cfg.Primary)
 	}
 	return b, nil
+}
+
+// invertedValueMaps swaps each entry's direction: FieldValueMaps is written
+// primary-form → secondary-form for filters, but a record coming back from the
+// secondary carries the secondary form, so its rewrite needs the reverse. A
+// collision (two forms to one) keeps the first; configs are 1:1.
+func invertedValueMaps(vm map[string]map[string]string) map[string]map[string]string {
+	out := make(map[string]map[string]string, len(vm))
+	for field, m := range vm {
+		inv := make(map[string]string, len(m))
+		for from, to := range m {
+			if _, ok := inv[to]; !ok {
+				inv[to] = from
+			}
+		}
+		out[field] = inv
+	}
+	return out
 }
 
 func validate(cfg Config) error {

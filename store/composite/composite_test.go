@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -858,5 +859,45 @@ func TestSecondaryExpiresMustBeAfterTheCutover(t *testing.T) {
 	cfg.SecondaryExpires = cutover.Add(30 * 24 * time.Hour)
 	if _, err := New(cfg); err != nil {
 		t.Errorf("a valid expiry was refused: %v", err)
+	}
+}
+
+func TestDocRewrite(t *testing.T) {
+	rw := DocRewrite{
+		RenameFrom: "event", RenameTo: "log",
+		TimeField: "@timestamp", TimeLayout: "2006-01-02 15:04:05.000",
+		Values: map[string]map[string]string{"status": {"2": "Open"}},
+	}
+	in := `{"event":{"user":"a"},"@timestamp":"2026-01-07T17:05:09.1Z","status":"2"}`
+	got := string(rw.Apply(json.RawMessage(in)))
+	if gjson.Get(got, "log.user").Str != "a" || gjson.Get(got, "event").Exists() {
+		t.Errorf("key not renamed: %s", got)
+	}
+	if gjson.Get(got, "@timestamp").Str != "2026-01-07 17:05:09.100" {
+		t.Errorf("time not remapped: %s", got)
+	}
+	if gjson.Get(got, "status").Str != "Open" {
+		t.Errorf("value not remapped: %s", got)
+	}
+
+	// Each piece works alone, and absent fields leave the record alone.
+	if got := string(DocRewrite{RenameFrom: "event", RenameTo: "log"}.Apply(json.RawMessage(`{"@timestamp":"x"}`))); !strings.Contains(got, `"x"`) {
+		t.Errorf("no rename configured, time must not be touched: %s", got)
+	}
+	if got := string(DocRewrite{TimeField: "@timestamp", TimeLayout: "2006"}.Apply(json.RawMessage(`{"status":"2"}`))); gjson.Get(got, "status").Str != "2" {
+		t.Errorf("absent time field must not be invented: %s", got)
+	}
+	// A value with no entry in the map passes through.
+	if got := string(rw.Apply(json.RawMessage(`{"status":"99"}`))); gjson.Get(got, "status").Str != "99" {
+		t.Errorf("unmapped value must stay: %s", got)
+	}
+	// A configured rewrite does nothing to a record that matches none of its fields.
+	untouched := `{"other":1}`
+	if got := string(DocRewrite{RenameFrom: "event", RenameTo: "log"}.Apply(json.RawMessage(untouched))); got != untouched {
+		t.Errorf("untouched record must come back verbatim: %s", got)
+	}
+	// A non-object comes back, not nil.
+	if got := string(DocRewrite{}.Apply(json.RawMessage(`not json`))); got != "not json" {
+		t.Errorf("non-object mangled: %s", got)
 	}
 }

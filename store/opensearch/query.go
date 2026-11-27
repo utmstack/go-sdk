@@ -61,6 +61,11 @@ func (d *Driver) timeRange(from, to time.Time) map[string]any {
 // to filterClause.
 func (d *Driver) clauseFor(ds store.Dataset, f store.Filter) (map[string]any, bool, error) {
 	if f.Op != store.OpSearch && f.Op != store.OpNotSearch {
+		if f.Op == store.OpEq || f.Op == store.OpNotEq || f.Op == store.OpIn || f.Op == store.OpNotIn {
+			// term/terms match exact tokens: a text-mapped field holds analyzed
+			// tokens, so its exact form is the .keyword subfield.
+			f.Field = d.exactField(f.Field)
+		}
 		return filterClause(f)
 	}
 	field := d.cfg.TextFields[ds]

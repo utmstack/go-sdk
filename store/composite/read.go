@@ -156,9 +156,6 @@ func (c *Store) FetchPage(ctx context.Context, s store.Scope, filters []store.Fi
 		return rows, total, err
 	}
 
-	if page.SortBy == c.cfg.TimeField {
-		return c.timePage(ctx, p, filters, page)
-	}
 	return c.mergedPage(ctx, p, filters, page)
 }
 

@@ -3,6 +3,7 @@ package composite
 import (
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/utmstack/go-sdk/v2/store"
 )
@@ -109,4 +110,92 @@ func RenameDocKey(from, to string) func(json.RawMessage) json.RawMessage {
 		}
 		return out
 	}
+}
+
+// DocRewrite is what a Config.SecondaryDocument can do to a record coming back
+// from the secondary, all in one decode pass: rename the top-level key the
+// stores disagree on, reformat a date field into the primary's layout, and
+// swap the values of fields the two stores name the same but keep in
+// different forms. A field or key absent from a record leaves it alone; a
+// record that is not a JSON object comes back as it came.
+type DocRewrite struct {
+	// RenameFrom and RenameTo swap one top-level key, the secondary's name for
+	// the primary's. RenameTo empty means no rename; a key already present
+	// under RenameTo wins.
+	RenameFrom, RenameTo string
+	// TimeField and TimeLayout reformat one field's RFC 3339 date into the
+	// layout the primary renders ("2006-01-02 15:04:05.000"). TimeField empty
+	// means no reformat; a value that does not parse passes through.
+	TimeField, TimeLayout string
+	// ReverseTime runs the reformat the other way: from TimeLayout back to RFC
+	// 3339, so a doc that came back remapped is valid for the secondary again
+	// before it is written.
+	ReverseTime bool
+	// Values maps a field's value, as the secondary keeps it, to the form the
+	// primary uses, so records read like the primary's.
+	Values map[string]map[string]string
+}
+
+func (r DocRewrite) Apply(doc json.RawMessage) json.RawMessage {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(doc, &top); err != nil {
+		return doc
+	}
+	changed := false
+
+	if r.RenameFrom != "" {
+		v, ok := top[r.RenameFrom]
+		if ok {
+			if _, exists := top[r.RenameTo]; exists {
+				delete(top, r.RenameFrom)
+			} else {
+				top[r.RenameTo] = v
+				delete(top, r.RenameFrom)
+			}
+			changed = true
+		}
+	}
+
+	if r.TimeField != "" {
+		if raw, ok := top[r.TimeField]; ok {
+			var s string
+			if json.Unmarshal(raw, &s) == nil {
+				if r.ReverseTime {
+					if t, err := time.Parse(r.TimeLayout, s); err == nil {
+						top[r.TimeField], _ = json.Marshal(t.UTC().Format(time.RFC3339Nano))
+						changed = true
+					}
+				} else if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+					top[r.TimeField], _ = json.Marshal(t.UTC().Format(r.TimeLayout))
+					changed = true
+				}
+			}
+		}
+	}
+
+	for field, m := range r.Values {
+		raw, ok := top[field]
+		if !ok {
+			continue
+		}
+		var s string
+		// The value may be kept as a number even when the map keys it by its
+		// text form, so fall back to the raw JSON token on a string unmarshal miss.
+		if err := json.Unmarshal(raw, &s); err != nil {
+			s = string(raw)
+		}
+		if nv, hit := m[s]; hit {
+			top[field], _ = json.Marshal(nv)
+			changed = true
+		}
+	}
+
+	if !changed {
+		return doc
+	}
+	out, err := json.Marshal(top)
+	if err != nil {
+		return doc
+	}
+	return out
 }
